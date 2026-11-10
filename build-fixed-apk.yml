@@ -1,0 +1,258 @@
+# Builds an APK from this fork's revision with the Android 17 PID-namespace
+# recovery fix (RecoveryPlatform.birth no longer throws when
+# /proc/self/ns/pid is missing; the privileged end reports
+# recoveryPidNsAvailable=false instead of faking a namespace).
+#
+# The Linux runtime payload is taken byte-for-byte from the official v1.0.15
+# release APK: `runtime/` is unchanged between v1.0.15 and the fix commit, so
+# rebuilding it would only add network and toolchain failure modes. Set
+# runtime_source=build to compile it from source instead.
+#
+# Two flavors are produced:
+#   stock-id     io.github.ccch1mneyyy.dsh_app      (only installs over the official
+#                                                    app after uninstalling it)
+#   parallel-id  io.github.ccch1mneyyy.dsh_app.fix  (installs alongside the official
+#                                                    app, which keeps its data)
+name: Build fixed APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_source:
+        description: "Runtime payload: official (reuse the v1.0.15 APK) or build (from source)"
+        type: choice
+        options: [official, build]
+        default: official
+      build_number:
+        description: "versionCode override (empty = build minute, UTC+8)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-fixed-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  NODE_VERSION: 24.22.1
+  GRADLE_VERSION: 9.3.1
+  TZ: Asia/Shanghai
+  # The Aliyun mirrors are slow and unreliable from a US runner (same as ci.yml).
+  DSH_MAVEN_MIRRORS: "0"
+  OFFICIAL_APK_URL: https://github.com/ccch1mneyyy/dsh-Go/releases/download/v1.0.15/dsh-go-1.0.15-arm64.apk
+  OFFICIAL_APK_SHA256: 231ac2a5155e5460466529b99790f111484378c3b1f579dc00cef0fe418928cb
+  OFFICIAL_ROOTFS_SHA256: ""
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: stock-id
+            app_id: io.github.ccch1mneyyy.dsh_app
+            artifact: dsh-go-fixed-stock
+          - label: parallel-id
+            app_id: io.github.ccch1mneyyy.dsh_app.fix
+            artifact: dsh-go-fixed-parallel
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Record the source revision
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SUBJECT=$(git log -1 --format=%s)" >> "$GITHUB_ENV"
+
+      - name: Free disk space (no emulator images, no unrelated toolchains)
+        run: |
+          sudo rm -rf /usr/local/lib/android/sdk/system-images \
+                      /usr/local/lib/android/sdk/emulator \
+                      /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Runtime payload from the official v1.0.15 APK
+        if: inputs.runtime_source == 'official'
+        run: |
+          set -euo pipefail
+          mkdir -p runtime/out/arm64-v8a/assets runtime/out/arm64-v8a/jniLibs/arm64-v8a
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o /tmp/official.apk "$OFFICIAL_APK_URL"
+          echo "$OFFICIAL_APK_SHA256  /tmp/official.apk" | sha256sum -c -
+          python3 - <<'PY'
+          import os, shutil, zipfile
+          assets = 'runtime/out/arm64-v8a/assets'
+          jni = 'runtime/out/arm64-v8a/jniLibs/arm64-v8a'
+          keep = {'libproot.so', 'libproot-loader.so', 'libtalloc.so', 'libandroid-shmem.so'}
+          n_assets = n_libs = 0
+          with zipfile.ZipFile('/tmp/official.apk') as z:
+              for name in z.namelist():
+                  if name.startswith('assets/runtime/') and not name.endswith('/'):
+                      dst = os.path.join(assets, name[len('assets/'):])
+                  elif name.startswith('lib/arm64-v8a/') and os.path.basename(name) in keep:
+                      dst = os.path.join(jni, os.path.basename(name))
+                  else:
+                      continue
+                  os.makedirs(os.path.dirname(dst), exist_ok=True)
+                  with z.open(name) as src, open(dst, 'wb') as out:
+                      shutil.copyfileobj(src, out, 1 << 20)
+                  if dst.startswith(assets):
+                      n_assets += 1
+                  else:
+                      n_libs += 1
+          print(f'assets={n_assets} jniLibs={n_libs}')
+          assert n_assets >= 5, 'runtime assets missing from the official APK'
+          assert n_libs == 4, 'runtime shared libraries missing from the official APK'
+          PY
+          ls -l runtime/out/arm64-v8a/assets/runtime runtime/out/arm64-v8a/jniLibs/arm64-v8a
+
+      - name: Runtime payload built from source
+        if: inputs.runtime_source == 'build'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gpgv binutils
+          bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Guard the runtime payload
+        run: |
+          set -euo pipefail
+          rootfs=runtime/out/arm64-v8a/assets/runtime/rootfs-arm64-v8a.tar.xz
+          test -s "$rootfs" || { echo "::error::$rootfs is missing or empty"; exit 1; }
+          test -s runtime/out/arm64-v8a/assets/runtime/manifest.json || { echo "::error::runtime manifest missing"; exit 1; }
+          echo "ROOTFS_SHA256=$(sha256sum "$rootfs" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "rootfs sha256: $(sha256sum "$rootfs" | cut -d' ' -f1)"
+          echo "rootfs bytes : $(stat -c %s "$rootfs")"
+
+      - name: Flutter dependencies and local.properties
+        working-directory: app
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - name: Generate the Gradle wrapper (gradlew is not tracked)
+        working-directory: app/android
+        run: |
+          set -euo pipefail
+          gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin --no-daemon
+          python3 - <<'PY'
+          import os, re
+          path = 'gradle/wrapper/gradle-wrapper.properties'
+          text = open(path).read()
+          url = 'distributionUrl=https\\://services.gradle.org/distributions/gradle-%s-bin.zip' % os.environ['GRADLE_VERSION']
+          text = re.sub(r'^distributionUrl=.*$', url.replace('\\', '\\\\'), text, flags=re.M)
+          open(path, 'w').write(text)
+          print(text)
+          PY
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Set the applicationId
+        run: |
+          set -euo pipefail
+          sed -i 's|applicationId = "io.github.ccch1mneyyy.dsh_app"|applicationId = "${{ matrix.app_id }}"|' app/android/app/build.gradle.kts
+          grep -n 'applicationId' app/android/app/build.gradle.kts
+
+      - name: Build the release APK (arm64)
+        env:
+          DSH_BETA_TOKEN_FILE: ""
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.build_number }}" ]; then
+            bash tooling/build-apk.sh -f arm64 -n "${{ inputs.build_number }}"
+          else
+            bash tooling/build-apk.sh -f arm64
+          fi
+
+      - name: Verify the APK
+        run: |
+          set -euo pipefail
+          APK="app/build/app/outputs/flutter-apk/app-arm64-release.apk"
+          test -f "$APK" || { echo "::error::no APK at $APK"; exit 1; }
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          BT="$(ls -1d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          {
+            echo "## APK report — ${{ matrix.label }}"
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| source_sha | \`$SOURCE_SHA\` |"
+            echo "| source_subject | $SOURCE_SUBJECT |"
+            echo "| application_id | \`${{ matrix.app_id }}\` |"
+            echo "| apk_file | \`$(basename "$APK")\` |"
+            echo "| apk_bytes | $(stat -c %s "$APK") |"
+            echo "| apk_sha256 | \`$(sha256sum "$APK" | cut -d' ' -f1)\` |"
+            echo "| rootfs_sha256 | \`$ROOTFS_SHA256\` |"
+            echo
+            echo '### package'
+            echo '```'
+            "$BT/aapt2" dump badging "$APK" | sed -n '/^package:/p;/^sdkVersion/p;/^targetSdkVersion/p;/^native-code/p'
+            echo '```'
+            echo '### signing certificate'
+            echo '```'
+            "$BT/apksigner" verify --print-certs "$APK" | sed -n '1,8p'
+            echo '```'
+            echo '### runtime payload inside the APK'
+            echo '```'
+            unzip -l "$APK" | awk '$4 ~ /^assets\/runtime\// || $4 ~ /^lib\/arm64-v8a\/(libproot|libtalloc|libandroid-shmem)/ {printf "%12s  %s\n", $1, $4}'
+            echo '```'
+          } | tee apk-report.md
+
+      - name: Scan the dex for the fix
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee -a apk-report.md
+          import os, zipfile
+          apk = os.environ['APK_PATH']
+          with zipfile.ZipFile(apk) as z:
+              dex = b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex'))
+          want = [b'recoveryPidNsAvailable', b'recoveryPidNsDev', b'recoveryPidNsIno',
+                  b'resourceRecoveryVersion', b'releaseReceipt', b'selfCheckProbeVersion',
+                  b'RecoveryPlatform', b'PrivilegedDisplayMain', b'PrivilegedDisplayService']
+          rows = [(w.decode(), dex.count(w)) for w in want]
+          print('### dex string scan')
+          print('```')
+          for name, hits in rows:
+              print(f'{name:<28} {"present" if hits else "MISSING":<8} ({hits} occurrences)')
+          print(f'{"dex bytes":<28} {len(dex)}')
+          print('```')
+          missing = [n for n, h in rows if not h]
+          if missing:
+              print(f'::error::dex is missing {", ".join(missing)}')
+              raise SystemExit(1)
+          PY
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            app/build/app/outputs/flutter-apk/app-arm64-release.apk
+            apk-report.md
+          if-no-files-found: error
+          retention-days: 30
